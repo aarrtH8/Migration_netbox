@@ -408,6 +408,10 @@ def payload_device(rec, im):
         "cluster": "clusters", "virtual_chassis": "virtual_chassis",
         "parent_device": "devices",
     })
+    # primary_ip4/6 require the IP to already be assigned to a device interface;
+    # interfaces don't exist yet at device creation time → applied in a third pass.
+    p.pop("primary_ip4", None)
+    p.pop("primary_ip6", None)
     p["custom_fields"] = FORCED_CUSTOM_FIELDS
     return p
 
@@ -672,6 +676,43 @@ def update_ip_assignments(nb, records, im, logger):
     return updated, skipped, errors
 
 
+def update_device_primary_ips(nb, records, im, logger):
+    """Third pass: set primary_ip4/primary_ip6 on devices after IPs are assigned to interfaces."""
+    dev_ep = nb.dcim.devices
+    updated = skipped = errors = 0
+    for rec in records:
+        old_dev_id = rec.get("id")
+        new_dev_id = im.get("devices", old_dev_id)
+        if not new_dev_id:
+            skipped += 1
+            continue
+
+        patch = {}
+        for field in ("primary_ip4", "primary_ip6"):
+            ip = rec.get(field)
+            if not ip:
+                continue
+            old_ip_id = ip.get("id") if isinstance(ip, dict) else ip
+            new_ip_id = im.get("ip_addresses", old_ip_id)
+            if new_ip_id:
+                patch[field] = new_ip_id
+
+        if not patch:
+            skipped += 1
+            continue
+
+        try:
+            dev_ep.patch(new_dev_id, **patch)
+            updated += 1
+            logger.info(f"[Device Primary IPs] Updated '{rec.get('name')}'")
+        except Exception as e:
+            errors += 1
+            logger.error(f"[Device Primary IPs] ERROR device_id={old_dev_id}: {e}\n{traceback.format_exc()}")
+
+    logger.info(f"[Device Primary IPs] Done — updated={updated} skipped={skipped} errors={errors}")
+    return updated, skipped, errors
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -752,7 +793,9 @@ def main():
         run(load("sites.json"),       "Sites",       nb.dcim.sites,       "sites",       payload_site,         by_slug)
         run(load("locations.json"),   "Locations",   nb.dcim.locations,   "locations",   payload_location,     by_slug)
         run(load("rack_roles.json"),  "Rack Roles",  nb.dcim.rack_roles,  "rack_roles",  payload_manufacturer, by_slug)
-        run(load("racks.json"),       "Racks",       nb.dcim.racks,       "racks",       payload_rack,         by_name)
+        run(load("racks.json"),       "Racks",       nb.dcim.racks,       "racks",       payload_rack,
+            lambda ep, rec: ep.get(name=rec["name"], site_id=im.get("sites", (rec.get("site") or {}).get("id")))
+            if rec.get("name") and (rec.get("site") or {}).get("id") else by_name(ep, rec))
     else:
         logger.info("=== Regions / Sites [SKIPPED — preloading IDs] ===")
         preload(load("regions.json"),     nb.dcim.regions,     "regions",     by_slug)
@@ -760,7 +803,9 @@ def main():
         preload(load("sites.json"),       nb.dcim.sites,       "sites",       by_slug)
         preload(load("locations.json"),   nb.dcim.locations,   "locations",   by_slug)
         preload(load("rack_roles.json"),  nb.dcim.rack_roles,  "rack_roles",  by_slug)
-        preload(load("racks.json"),       nb.dcim.racks,       "racks",       by_name)
+        preload(load("racks.json"),       nb.dcim.racks,       "racks",
+            lambda ep, rec: ep.get(name=rec["name"], site_id=im.get("sites", (rec.get("site") or {}).get("id")))
+            if rec.get("name") and (rec.get("site") or {}).get("id") else by_name(ep, rec))
 
     # ── Virtualization / Clusters (before IPAM so vlan_groups can reference clusters) ──
     if active("clusters"):
@@ -943,6 +988,11 @@ def main():
     if active("ip_assignments"):
         logger.info("=== IP Address Assignments (second pass) ===")
         u, s, e = update_ip_assignments(nb, ip_address_records, im, logger)
+        total_updated += u
+        total_errors += e
+
+        logger.info("=== Device Primary IPs (third pass) ===")
+        u, s, e = update_device_primary_ips(nb, load("devices.json"), im, logger)
         total_updated += u
         total_errors += e
     else:
