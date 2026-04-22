@@ -237,6 +237,9 @@ def by_vid_group(ep, rec):
 SKIP_FIELDS = {"id", "url", "display", "created", "last_updated",
                "custom_fields", "tags", "local_context_data"}
 
+# Custom fields forcés à la création, quelle que soit la valeur source.
+FORCED_CUSTOM_FIELDS = {"Squad": "choice1"}
+
 
 def clean_payload(obj: dict) -> dict:
     result = {}
@@ -342,6 +345,7 @@ def payload_virtual_chassis(rec, im):
     p = build_payload_with_remap(rec, im, {})
     p.pop("master", None)
     p.pop("member_count", None)
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
     return p
 
 def payload_cluster_type(rec, im):
@@ -353,11 +357,13 @@ def payload_cluster(rec, im):
     })
 
 def payload_virtual_machine(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "cluster": "clusters", "site": "sites", "role": "device_roles",
         "platform": "platforms", "tenant": "tenants",
         "primary_ip4": "ip_addresses", "primary_ip6": "ip_addresses",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_vm_interface(rec, im):
     return build_payload_with_remap(rec, im, {
@@ -373,7 +379,7 @@ def payload_virtual_device_context(rec, im):
     })
 
 def payload_device(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "site": "sites", "rack": "racks", "location": "locations",
         "device_type": "device_types", "role": "device_roles",
         "platform": "platforms", "tenant": "tenants",
@@ -381,6 +387,8 @@ def payload_device(rec, im):
         "cluster": "clusters", "virtual_chassis": "virtual_chassis",
         "parent_device": "devices",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_interface(rec, im):
     return build_payload_with_remap(rec, im, {
@@ -475,7 +483,9 @@ def payload_asn_range(rec, im):
     return build_payload_with_remap(rec, im, {"rir": "rirs", "tenant": "tenants"})
 
 def payload_asn(rec, im):
-    return build_payload_with_remap(rec, im, {"rir": "rirs", "tenant": "tenants"})
+    p = build_payload_with_remap(rec, im, {"rir": "rirs", "tenant": "tenants"})
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_aggregate(rec, im):
     return build_payload_with_remap(rec, im, {"rir": "rirs", "tenant": "tenants"})
@@ -484,39 +494,51 @@ def payload_ipam_role(rec, im):
     return build_payload_with_remap(rec, im, {})
 
 def payload_vlan_group(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "site": "sites", "location": "locations", "rack": "racks",
         "cluster": "clusters", "tenant": "tenants",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_vlan(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "site": "sites", "group": "vlan_groups", "tenant": "tenants", "role": "roles",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_route_target(rec, im):
     return build_payload_with_remap(rec, im, {"tenant": "tenants"})
 
 def payload_vrf(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "tenant": "tenants", "import_targets": "route_targets", "export_targets": "route_targets",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_prefix(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "site": "sites", "vrf": "vrfs", "tenant": "tenants", "vlan": "vlans", "role": "roles",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_ip_range(rec, im):
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "vrf": "vrfs", "tenant": "tenants", "role": "roles",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_ip_address(rec, im):
     # assigned_object is applied in a second pass after all interfaces are imported.
-    return build_payload_with_remap(rec, im, {
+    p = build_payload_with_remap(rec, im, {
         "vrf": "vrfs", "tenant": "tenants", "nat_inside": "ip_addresses",
     })
+    p["custom_fields"] = FORCED_CUSTOM_FIELDS
+    return p
 
 def payload_service_template(rec, im):
     return build_payload_with_remap(rec, im, {"ipaddresses": "ip_addresses"})
