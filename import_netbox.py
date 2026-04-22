@@ -533,10 +533,13 @@ def payload_ip_range(rec, im):
     return p
 
 def payload_ip_address(rec, im):
-    # assigned_object is applied in a second pass after all interfaces are imported.
+    # assigned_object_type/id are scalars that slip through build_payload_with_remap;
+    # they must be excluded here and applied in the second pass (update_ip_assignments).
     p = build_payload_with_remap(rec, im, {
         "vrf": "vrfs", "tenant": "tenants", "nat_inside": "ip_addresses",
     })
+    p.pop("assigned_object_type", None)
+    p.pop("assigned_object_id", None)
     p["custom_fields"] = FORCED_CUSTOM_FIELDS
     return p
 
@@ -657,6 +660,16 @@ def parse_args():
     parser.add_argument("--input-dir", required=True, help="Directory containing exported JSON files")
     parser.add_argument("--log", default="import_errors.log", help="Log file path (default: import_errors.log)")
     parser.add_argument("--no-verify", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument(
+        "--skip-sections",
+        default="",
+        metavar="SECTIONS",
+        help=(
+            "Comma-separated list of sections to skip. "
+            "Available: tenancy, sites, clusters, ipam, devices, "
+            "virtual_machines, services, ip_assignments"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -678,6 +691,13 @@ def main():
     def load(filename):
         return load_json(args.input_dir, filename)
 
+    skip_sections = {s.strip().lower() for s in args.skip_sections.split(",") if s.strip()}
+    if skip_sections:
+        logger.info(f"Skipping sections: {', '.join(sorted(skip_sections))}")
+
+    def active(section: str) -> bool:
+        return section not in skip_sections
+
     total_created = total_skipped = total_errors = total_updated = 0
 
     def run(records, label, endpoint, type_name, payload_fn, lookup_fn=None):
@@ -691,124 +711,146 @@ def main():
         total_errors += e
 
     # ── Tenancy ──────────────────────────────────────────────────────────────────
-    logger.info("=== Tenancy ===")
-    run(load("tenant_groups.json"), "Tenant Groups", nb.tenancy.tenant_groups, "tenant_groups", payload_tenant_group, by_slug)
-    run(load("tenants.json"),       "Tenants",       nb.tenancy.tenants,       "tenants",        payload_tenant,       by_slug)
+    if active("tenancy"):
+        logger.info("=== Tenancy ===")
+        run(load("tenant_groups.json"), "Tenant Groups", nb.tenancy.tenant_groups, "tenant_groups", payload_tenant_group, by_slug)
+        run(load("tenants.json"),       "Tenants",       nb.tenancy.tenants,       "tenants",        payload_tenant,       by_slug)
+    else:
+        logger.info("=== Tenancy [SKIPPED] ===")
 
     # ── Regions / Sites ───────────────────────────────────────────────────────────
-    logger.info("=== Regions / Sites ===")
-    run(load("regions.json"),     "Regions",     nb.dcim.regions,     "regions",     payload_region,       by_slug)
-    run(load("site_groups.json"), "Site Groups", nb.dcim.site_groups, "site_groups", payload_site_group,   by_slug)
-    run(load("sites.json"),       "Sites",       nb.dcim.sites,       "sites",       payload_site,         by_slug)
-    run(load("locations.json"),   "Locations",   nb.dcim.locations,   "locations",   payload_location,     by_slug)
-    run(load("rack_roles.json"),  "Rack Roles",  nb.dcim.rack_roles,  "rack_roles",  payload_manufacturer, by_slug)
-    run(load("racks.json"),       "Racks",       nb.dcim.racks,       "racks",       payload_rack,         by_name)
+    if active("sites"):
+        logger.info("=== Regions / Sites ===")
+        run(load("regions.json"),     "Regions",     nb.dcim.regions,     "regions",     payload_region,       by_slug)
+        run(load("site_groups.json"), "Site Groups", nb.dcim.site_groups, "site_groups", payload_site_group,   by_slug)
+        run(load("sites.json"),       "Sites",       nb.dcim.sites,       "sites",       payload_site,         by_slug)
+        run(load("locations.json"),   "Locations",   nb.dcim.locations,   "locations",   payload_location,     by_slug)
+        run(load("rack_roles.json"),  "Rack Roles",  nb.dcim.rack_roles,  "rack_roles",  payload_manufacturer, by_slug)
+        run(load("racks.json"),       "Racks",       nb.dcim.racks,       "racks",       payload_rack,         by_name)
+    else:
+        logger.info("=== Regions / Sites [SKIPPED] ===")
 
     # ── Virtualization / Clusters (before IPAM so vlan_groups can reference clusters) ──
-    logger.info("=== Virtualization / Clusters ===")
-    run(load("cluster_types.json"), "Cluster Types", nb.virtualization.cluster_types, "cluster_types", payload_cluster_type, by_slug)
-    run(load("clusters.json"),      "Clusters",      nb.virtualization.clusters,      "clusters",      payload_cluster,      by_name)
+    if active("clusters"):
+        logger.info("=== Virtualization / Clusters ===")
+        run(load("cluster_types.json"), "Cluster Types", nb.virtualization.cluster_types, "cluster_types", payload_cluster_type, by_slug)
+        run(load("clusters.json"),      "Clusters",      nb.virtualization.clusters,      "clusters",      payload_cluster,      by_name)
+    else:
+        logger.info("=== Virtualization / Clusters [SKIPPED] ===")
+
 
     # ── IPAM ─────────────────────────────────────────────────────────────────────
     # IP addresses are imported without assigned_object; assignments are applied
     # in a second pass after all interfaces (device + VM) are imported.
-    logger.info("=== IPAM ===")
-    run(load("rirs.json"),       "RIRs",       nb.ipam.rirs,       "rirs",       payload_rir,       by_slug)
-    run(load("asn_ranges.json"), "ASN Ranges", nb.ipam.asn_ranges, "asn_ranges", payload_asn_range, by_name)
-    run(load("asns.json"),       "ASNs",       nb.ipam.asns,       "asns",       payload_asn,
-        lambda ep, rec: (ep.filter(asn=rec["asn"]) or [None])[0])
-    run(load("aggregates.json"), "Aggregates", nb.ipam.aggregates, "aggregates", payload_aggregate,
-        lambda ep, rec: (ep.filter(prefix=rec["prefix"]) or [None])[0])
-    run(load("roles.json"),      "IPAM Roles", nb.ipam.roles,      "roles",      payload_ipam_role, by_slug)
-    run(load("route_targets.json"), "Route Targets", nb.ipam.route_targets, "route_targets", payload_route_target,
-        lambda ep, rec: (ep.filter(name=rec["name"]) or [None])[0])
-    run(load("vrfs.json"), "VRFs", nb.ipam.vrfs, "vrfs", payload_vrf,
-        lambda ep, rec: (ep.filter(name=rec["name"], rd=rec.get("rd")) or [None])[0])
-    run(load("vlan_groups.json"), "VLAN Groups", nb.ipam.vlan_groups, "vlan_groups", payload_vlan_group, by_slug)
-    run(load("vlans.json"), "VLANs", nb.ipam.vlans, "vlans", payload_vlan,
-        lambda ep, rec: (ep.filter(
-            vid=rec["vid"],
-            **( {"group_id": im.get("vlan_groups", rec["group"]["id"])}
-                if rec.get("group") and rec["group"].get("id") else {} )
-        ) or [None])[0])
-    run(load("prefixes.json"),    "Prefixes",    nb.ipam.prefixes,    "prefixes",    payload_prefix,     by_prefix)
-    run(load("ip_ranges.json"),   "IP Ranges",   nb.ipam.ip_ranges,   "ip_ranges",   payload_ip_range,
-        lambda ep, rec: (ep.filter(start_address=rec["start_address"], end_address=rec["end_address"]) or [None])[0])
     ip_address_records = load("ip_addresses.json")
-    run(ip_address_records, "IP Addresses", nb.ipam.ip_addresses, "ip_addresses", payload_ip_address, by_address)
-    run(load("fhrp_groups.json"), "FHRP Groups", nb.ipam.fhrp_groups, "fhrp_groups", payload_fhrp_group, by_name)
+    if active("ipam"):
+        logger.info("=== IPAM ===")
+        run(load("rirs.json"),       "RIRs",       nb.ipam.rirs,       "rirs",       payload_rir,       by_slug)
+        run(load("asn_ranges.json"), "ASN Ranges", nb.ipam.asn_ranges, "asn_ranges", payload_asn_range, by_name)
+        run(load("asns.json"),       "ASNs",       nb.ipam.asns,       "asns",       payload_asn,
+            lambda ep, rec: (ep.filter(asn=rec["asn"]) or [None])[0])
+        run(load("aggregates.json"), "Aggregates", nb.ipam.aggregates, "aggregates", payload_aggregate,
+            lambda ep, rec: (ep.filter(prefix=rec["prefix"]) or [None])[0])
+        run(load("roles.json"),      "IPAM Roles", nb.ipam.roles,      "roles",      payload_ipam_role, by_slug)
+        run(load("route_targets.json"), "Route Targets", nb.ipam.route_targets, "route_targets", payload_route_target,
+            lambda ep, rec: (ep.filter(name=rec["name"]) or [None])[0])
+        run(load("vrfs.json"), "VRFs", nb.ipam.vrfs, "vrfs", payload_vrf,
+            lambda ep, rec: (ep.filter(name=rec["name"], rd=rec.get("rd")) or [None])[0])
+        run(load("vlan_groups.json"), "VLAN Groups", nb.ipam.vlan_groups, "vlan_groups", payload_vlan_group, by_slug)
+        run(load("vlans.json"), "VLANs", nb.ipam.vlans, "vlans", payload_vlan,
+            lambda ep, rec: (ep.filter(
+                vid=rec["vid"],
+                **( {"group_id": im.get("vlan_groups", rec["group"]["id"])}
+                    if rec.get("group") and rec["group"].get("id") else {} )
+            ) or [None])[0])
+        run(load("prefixes.json"),  "Prefixes",  nb.ipam.prefixes,  "prefixes",  payload_prefix,  by_prefix)
+        run(load("ip_ranges.json"), "IP Ranges", nb.ipam.ip_ranges, "ip_ranges", payload_ip_range,
+            lambda ep, rec: (ep.filter(start_address=rec["start_address"], end_address=rec["end_address"]) or [None])[0])
+        run(ip_address_records, "IP Addresses", nb.ipam.ip_addresses, "ip_addresses", payload_ip_address, by_address)
+        run(load("fhrp_groups.json"), "FHRP Groups", nb.ipam.fhrp_groups, "fhrp_groups", payload_fhrp_group, by_name)
+    else:
+        logger.info("=== IPAM [SKIPPED] ===")
 
     # ── DCIM / Devices ────────────────────────────────────────────────────────────
-    logger.info("=== DCIM / Devices ===")
-    run(load("manufacturers.json"), "Manufacturers", nb.dcim.manufacturers, "manufacturers", payload_manufacturer, by_slug)
-    run(load("device_types.json"),  "Device Types",  nb.dcim.device_types,  "device_types",  payload_device_type,
-        lambda ep, rec: ep.get(
-            manufacturer_id=im.get("manufacturers", (rec.get("manufacturer") or {}).get("id")),
-            model=rec["model"]) if rec.get("manufacturer") else None)
-    run(load("module_types.json"),  "Module Types",  nb.dcim.module_types,  "module_types",  payload_module_type,  by_name)
-    run(load("device_roles.json"),  "Device Roles",  nb.dcim.device_roles,  "device_roles",  payload_device_role,  by_slug)
-    run(load("platforms.json"),     "Platforms",     nb.dcim.platforms,     "platforms",     payload_platform,     by_slug)
-    # Virtual chassis created without master; master is set after devices are imported.
     virtual_chassis_records = load("virtual_chassis.json")
-    run(virtual_chassis_records, "Virtual Chassis", nb.dcim.virtual_chassis, "virtual_chassis", payload_virtual_chassis,
-        lambda ep, rec: ep.get(name=rec["name"]) if rec.get("name") else None)
-    run(load("devices.json"), "Devices", nb.dcim.devices, "devices", payload_device,
-        lambda ep, rec: ep.get(name=rec["name"], site_id=im.get("sites", (rec.get("site") or {}).get("id"))))
-    run(load("modules.json"),   "Modules",   nb.dcim.modules,   "modules",   payload_module,   None)
-    run(load("interfaces.json"), "Interfaces", nb.dcim.interfaces, "interfaces", payload_interface,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("console_ports.json"), "Console Ports", nb.dcim.console_ports, "console_ports", payload_console_port,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("console_server_ports.json"), "Console Server Ports", nb.dcim.console_server_ports, "console_server_ports",
-        payload_console_server_port,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("power_ports.json"),   "Power Ports",   nb.dcim.power_ports,   "power_ports",   payload_power_port,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("power_outlets.json"), "Power Outlets", nb.dcim.power_outlets, "power_outlets", payload_power_outlet,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("rear_ports.json"),    "Rear Ports",    nb.dcim.rear_ports,    "rear_ports",    payload_rear_port,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("front_ports.json"),   "Front Ports",   nb.dcim.front_ports,   "front_ports",   payload_front_port,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("device_bays.json"),   "Device Bays",   nb.dcim.device_bays,   "device_bays",   payload_device_bay,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-    run(load("inventory_items.json"), "Inventory Items", nb.dcim.inventory_items, "inventory_items", payload_inventory_item, None)
-    run(load("power_panels.json"),  "Power Panels",  nb.dcim.power_panels,  "power_panels",  payload_power_panel,  by_name)
-    run(load("power_feeds.json"),   "Power Feeds",   nb.dcim.power_feeds,   "power_feeds",   payload_power_feed,   by_name)
-    run(load("cables.json"),        "Cables",        nb.dcim.cables,        "cables",        payload_cable,        None)
-    run(load("virtual_device_contexts.json"), "Virtual Device Contexts", nb.dcim.virtual_device_contexts,
-        "virtual_device_contexts", payload_virtual_device_context,
-        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
-
-    # ── Virtual Chassis: set master device (second pass) ─────────────────────────
-    logger.info("=== Virtual Chassis Masters (second pass) ===")
-    u, s, e = update_virtual_chassis_masters(nb, virtual_chassis_records, im, logger)
-    total_updated += u
-    total_errors += e
+    if active("devices"):
+        logger.info("=== DCIM / Devices ===")
+        run(load("manufacturers.json"), "Manufacturers", nb.dcim.manufacturers, "manufacturers", payload_manufacturer, by_slug)
+        run(load("device_types.json"),  "Device Types",  nb.dcim.device_types,  "device_types",  payload_device_type,
+            lambda ep, rec: ep.get(
+                manufacturer_id=im.get("manufacturers", (rec.get("manufacturer") or {}).get("id")),
+                model=rec["model"]) if rec.get("manufacturer") else None)
+        run(load("module_types.json"),  "Module Types",  nb.dcim.module_types,  "module_types",  payload_module_type,  by_name)
+        run(load("device_roles.json"),  "Device Roles",  nb.dcim.device_roles,  "device_roles",  payload_device_role,  by_slug)
+        run(load("platforms.json"),     "Platforms",     nb.dcim.platforms,     "platforms",     payload_platform,     by_slug)
+        run(virtual_chassis_records, "Virtual Chassis", nb.dcim.virtual_chassis, "virtual_chassis", payload_virtual_chassis,
+            lambda ep, rec: ep.get(name=rec["name"]) if rec.get("name") else None)
+        run(load("devices.json"), "Devices", nb.dcim.devices, "devices", payload_device,
+            lambda ep, rec: ep.get(name=rec["name"], site_id=im.get("sites", (rec.get("site") or {}).get("id"))))
+        run(load("modules.json"),   "Modules",   nb.dcim.modules,   "modules",   payload_module,   None)
+        run(load("interfaces.json"), "Interfaces", nb.dcim.interfaces, "interfaces", payload_interface,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("console_ports.json"), "Console Ports", nb.dcim.console_ports, "console_ports", payload_console_port,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("console_server_ports.json"), "Console Server Ports", nb.dcim.console_server_ports, "console_server_ports",
+            payload_console_server_port,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("power_ports.json"),   "Power Ports",   nb.dcim.power_ports,   "power_ports",   payload_power_port,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("power_outlets.json"), "Power Outlets", nb.dcim.power_outlets, "power_outlets", payload_power_outlet,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("rear_ports.json"),    "Rear Ports",    nb.dcim.rear_ports,    "rear_ports",    payload_rear_port,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("front_ports.json"),   "Front Ports",   nb.dcim.front_ports,   "front_ports",   payload_front_port,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("device_bays.json"),   "Device Bays",   nb.dcim.device_bays,   "device_bays",   payload_device_bay,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        run(load("inventory_items.json"), "Inventory Items", nb.dcim.inventory_items, "inventory_items", payload_inventory_item, None)
+        run(load("power_panels.json"),  "Power Panels",  nb.dcim.power_panels,  "power_panels",  payload_power_panel,  by_name)
+        run(load("power_feeds.json"),   "Power Feeds",   nb.dcim.power_feeds,   "power_feeds",   payload_power_feed,   by_name)
+        run(load("cables.json"),        "Cables",        nb.dcim.cables,        "cables",        payload_cable,        None)
+        run(load("virtual_device_contexts.json"), "Virtual Device Contexts", nb.dcim.virtual_device_contexts,
+            "virtual_device_contexts", payload_virtual_device_context,
+            lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
+        logger.info("=== Virtual Chassis Masters (second pass) ===")
+        u, s, e = update_virtual_chassis_masters(nb, virtual_chassis_records, im, logger)
+        total_updated += u
+        total_errors += e
+    else:
+        logger.info("=== DCIM / Devices [SKIPPED] ===")
 
     # ── Virtualization / Virtual Machines ─────────────────────────────────────────
-    logger.info("=== Virtualization / Virtual Machines ===")
-    run(load("virtual_machines.json"), "Virtual Machines", nb.virtualization.virtual_machines, "virtual_machines",
-        payload_virtual_machine,
-        lambda ep, rec: (ep.filter(name=rec["name"]) or [None])[0])
-    run(load("vm_interfaces.json"), "VM Interfaces", nb.virtualization.interfaces, "vm_interfaces",
-        payload_vm_interface,
-        lambda ep, rec: ep.get(
-            virtual_machine_id=im.get("virtual_machines", (rec.get("virtual_machine") or {}).get("id")),
-            name=rec["name"]))
+    if active("virtual_machines"):
+        logger.info("=== Virtualization / Virtual Machines ===")
+        run(load("virtual_machines.json"), "Virtual Machines", nb.virtualization.virtual_machines, "virtual_machines",
+            payload_virtual_machine,
+            lambda ep, rec: (ep.filter(name=rec["name"]) or [None])[0])
+        run(load("vm_interfaces.json"), "VM Interfaces", nb.virtualization.interfaces, "vm_interfaces",
+            payload_vm_interface,
+            lambda ep, rec: ep.get(
+                virtual_machine_id=im.get("virtual_machines", (rec.get("virtual_machine") or {}).get("id")),
+                name=rec["name"]))
+    else:
+        logger.info("=== Virtualization / Virtual Machines [SKIPPED] ===")
 
     # ── Services ─────────────────────────────────────────────────────────────────
-    logger.info("=== Services ===")
-    run(load("service_templates.json"), "Service Templates", nb.ipam.service_templates, "service_templates", payload_service_template, by_name)
-    run(load("services.json"),          "Services",          nb.ipam.services,          "services",          payload_service, None)
-    run(load("fhrp_group_assignments.json"), "FHRP Assignments", nb.ipam.fhrp_group_assignments,
-        "fhrp_group_assignments", payload_fhrp_group_assignment, None)
+    if active("services"):
+        logger.info("=== Services ===")
+        run(load("service_templates.json"), "Service Templates", nb.ipam.service_templates, "service_templates", payload_service_template, by_name)
+        run(load("services.json"),          "Services",          nb.ipam.services,          "services",          payload_service, None)
+        run(load("fhrp_group_assignments.json"), "FHRP Assignments", nb.ipam.fhrp_group_assignments,
+            "fhrp_group_assignments", payload_fhrp_group_assignment, None)
+    else:
+        logger.info("=== Services [SKIPPED] ===")
 
     # ── IP Address interface assignments (second pass) ────────────────────────────
-    logger.info("=== IP Address Assignments (second pass) ===")
-    u, s, e = update_ip_assignments(nb, ip_address_records, im, logger)
-    total_updated += u
-    total_errors += e
+    if active("ip_assignments"):
+        logger.info("=== IP Address Assignments (second pass) ===")
+        u, s, e = update_ip_assignments(nb, ip_address_records, im, logger)
+        total_updated += u
+        total_errors += e
+    else:
+        logger.info("=== IP Address Assignments [SKIPPED] ===")
 
     logger.info(
         f"\n=== Import complete ===\n"
