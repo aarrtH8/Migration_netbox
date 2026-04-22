@@ -322,6 +322,53 @@ def payload_platform(rec, im):
         "manufacturer": "manufacturers",
     })
 
+def payload_virtual_chassis(rec, im):
+    # Create without master; master is set in a second pass after devices are imported.
+    p = build_payload_with_remap(rec, im, {})
+    p.pop("master", None)
+    p.pop("member_count", None)
+    return p
+
+def payload_cluster_type(rec, im):
+    return build_payload_with_remap(rec, im, {})
+
+def payload_cluster(rec, im):
+    return build_payload_with_remap(rec, im, {
+        "type": "cluster_types",
+        "site": "sites",
+        "group": "site_groups",
+        "tenant": "tenants",
+    })
+
+def payload_virtual_machine(rec, im):
+    return build_payload_with_remap(rec, im, {
+        "cluster": "clusters",
+        "site": "sites",
+        "role": "device_roles",
+        "platform": "platforms",
+        "tenant": "tenants",
+        "primary_ip4": "ip_addresses",
+        "primary_ip6": "ip_addresses",
+    })
+
+def payload_vm_interface(rec, im):
+    return build_payload_with_remap(rec, im, {
+        "virtual_machine": "virtual_machines",
+        "parent": "vm_interfaces",
+        "bridge": "vm_interfaces",
+        "untagged_vlan": "vlans",
+        "tagged_vlans": "vlans",
+        "vrf": "vrfs",
+    })
+
+def payload_virtual_device_context(rec, im):
+    return build_payload_with_remap(rec, im, {
+        "device": "devices",
+        "tenant": "tenants",
+        "primary_ip4": "ip_addresses",
+        "primary_ip6": "ip_addresses",
+    })
+
 def payload_device(rec, im):
     return build_payload_with_remap(rec, im, {
         "site": "sites",
@@ -333,8 +380,8 @@ def payload_device(rec, im):
         "tenant": "tenants",
         "primary_ip4": "ip_addresses",
         "primary_ip6": "ip_addresses",
-        "cluster": None,
-        "virtual_chassis": None,
+        "cluster": "clusters",
+        "virtual_chassis": "virtual_chassis",
         "parent_device": "devices",
     })
 
@@ -485,7 +532,7 @@ def payload_vlan_group(rec, im):
         "site": "sites",
         "location": "locations",
         "rack": "racks",
-        "cluster": None,
+        "cluster": "clusters",
         "tenant": "tenants",
     })
 
@@ -540,7 +587,7 @@ def payload_service_template(rec, im):
 def payload_service(rec, im):
     return build_payload_with_remap(rec, im, {
         "device": "devices",
-        "virtual_machine": None,
+        "virtual_machine": "virtual_machines",
         "ipaddresses": "ip_addresses",
     })
 
@@ -548,10 +595,120 @@ def payload_fhrp_group(rec, im):
     return build_payload_with_remap(rec, im, {})
 
 def payload_fhrp_group_assignment(rec, im):
-    return build_payload_with_remap(rec, im, {
-        "group": "fhrp_groups",
-        "interface": "interfaces",
-    })
+    IFACE_TYPE_MAP = {
+        "dcim.interface": "interfaces",
+        "virtualization.vminterface": "vm_interfaces",
+    }
+    payload = {}
+
+    group = rec.get("group")
+    if isinstance(group, dict) and "id" in group:
+        new_group_id = im.get("fhrp_groups", group["id"])
+        if new_group_id is not None:
+            payload["group"] = new_group_id
+
+    iface_type = rec.get("interface_type")
+    iface_id = rec.get("interface_id")
+    if not iface_id and isinstance(rec.get("interface"), dict):
+        iface_id = rec["interface"].get("id")
+
+    if iface_type and iface_id:
+        mapper_type = IFACE_TYPE_MAP.get(iface_type)
+        new_iface_id = im.get(mapper_type, iface_id) if mapper_type else iface_id
+        if new_iface_id is not None:
+            payload["interface_type"] = iface_type
+            payload["interface_id"] = new_iface_id
+
+    if rec.get("priority") is not None:
+        payload["priority"] = rec["priority"]
+
+    return payload
+
+
+# ─── Second-pass update functions ────────────────────────────────────────────────
+
+def update_virtual_chassis_masters(nb, records, im, logger):
+    """
+    Second pass: set the master device on each virtual chassis.
+    Must run after devices are imported so device IDs are available.
+    """
+    updated = skipped = errors = 0
+    for rec in records:
+        master = rec.get("master")
+        if not master:
+            continue
+        old_master_id = master.get("id") if isinstance(master, dict) else master
+        old_vc_id = rec.get("id")
+        new_vc_id = im.get("virtual_chassis", old_vc_id)
+        new_master_id = im.get("devices", old_master_id)
+        if not new_vc_id or not new_master_id:
+            logger.warning(
+                f"[VC Master] Cannot remap vc_id={old_vc_id}, master device_id={old_master_id}"
+            )
+            skipped += 1
+            continue
+        try:
+            vc_obj = nb.dcim.virtual_chassis.get(new_vc_id)
+            if vc_obj:
+                vc_obj.master = new_master_id
+                vc_obj.save()
+                updated += 1
+                logger.info(f"[VC Master] Set master for '{rec.get('name')}'")
+        except Exception as e:
+            errors += 1
+            logger.error(
+                f"[VC Master] ERROR vc_id={old_vc_id}: {e}\n{traceback.format_exc()}"
+            )
+    logger.info(f"[Virtual Chassis Masters] Done — updated={updated} skipped={skipped} errors={errors}")
+    return updated, skipped, errors
+
+
+def update_ip_assignments(nb, records, im, logger):
+    """
+    Second pass: assign IP addresses to their interfaces.
+    Must run after all device interfaces and VM interfaces are imported.
+    """
+    OBJECT_TYPE_MAP = {
+        "dcim.interface": "interfaces",
+        "virtualization.vminterface": "vm_interfaces",
+    }
+    updated = skipped = errors = 0
+    for rec in records:
+        obj_type = rec.get("assigned_object_type")
+        obj_id = rec.get("assigned_object_id")
+        old_ip_id = rec.get("id")
+        if not obj_type or not obj_id:
+            continue
+        mapper_type = OBJECT_TYPE_MAP.get(obj_type)
+        if not mapper_type:
+            logger.warning(f"[IP Assignment] Unknown assigned_object_type: '{obj_type}' for ip_id={old_ip_id}")
+            skipped += 1
+            continue
+        new_obj_id = im.get(mapper_type, obj_id)
+        new_ip_id = im.get("ip_addresses", old_ip_id)
+        if not new_obj_id or not new_ip_id:
+            logger.warning(
+                f"[IP Assignment] Cannot remap ip_id={old_ip_id} → {obj_type} id={obj_id}"
+            )
+            skipped += 1
+            continue
+        try:
+            ip_obj = nb.ipam.ip_addresses.get(new_ip_id)
+            if ip_obj:
+                ip_obj.assigned_object_type = obj_type
+                ip_obj.assigned_object_id = new_obj_id
+                ip_obj.save()
+                updated += 1
+                logger.info(
+                    f"[IP Assignment] {rec.get('address')} → {obj_type} id={new_obj_id}"
+                )
+        except Exception as e:
+            errors += 1
+            logger.error(
+                f"[IP Assignment] ERROR ip_id={old_ip_id}: {e}\n{traceback.format_exc()}"
+            )
+    logger.info(f"[IP Assignments] Done — updated={updated} skipped={skipped} errors={errors}")
+    return updated, skipped, errors
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
@@ -584,7 +741,7 @@ def main():
     def load(filename):
         return load_json(args.input_dir, filename)
 
-    total_created = total_skipped = total_errors = 0
+    total_created = total_skipped = total_errors = total_updated = 0
 
     def run(records, label, endpoint, type_name, payload_fn, lookup_fn=None):
         nonlocal total_created, total_skipped, total_errors
@@ -610,7 +767,14 @@ def main():
     run(load("rack_roles.json"),  "Rack Roles",  nb.dcim.rack_roles,  "rack_roles",  payload_manufacturer, by_slug)
     run(load("racks.json"),       "Racks",       nb.dcim.racks,       "racks",       payload_rack,       by_name)
 
+    # ── Virtualization / Clusters (before IPAM so vlan_groups can reference clusters) ──
+    logger.info("=== Virtualization / Clusters ===")
+    run(load("cluster_types.json"), "Cluster Types", nb.virtualization.cluster_types, "cluster_types", payload_cluster_type, by_slug)
+    run(load("clusters.json"),      "Clusters",      nb.virtualization.clusters,      "clusters",      payload_cluster,      by_name)
+
     # ── IPAM (before devices so IP addresses exist for primary_ip assignment) ────
+    # Note: IP addresses are imported without assigned_object here; assignments
+    # are applied in a second pass after all interfaces (device + VM) are imported.
     logger.info("=== IPAM ===")
     run(load("rirs.json"),        "RIRs",        nb.ipam.rirs,        "rirs",        payload_rir,        by_slug)
     run(load("asn_ranges.json"),  "ASN Ranges",  nb.ipam.asn_ranges,  "asn_ranges",  payload_asn_range,  by_name)
@@ -628,7 +792,8 @@ def main():
     run(load("prefixes.json"),    "Prefixes",    nb.ipam.prefixes,    "prefixes",    payload_prefix,     by_prefix)
     run(load("ip_ranges.json"),   "IP Ranges",   nb.ipam.ip_ranges,   "ip_ranges",   payload_ip_range,
         lambda ep, rec: (list(ep.filter(start_address=rec["start_address"], end_address=rec["end_address"])) or [None])[0])
-    run(load("ip_addresses.json"), "IP Addresses", nb.ipam.ip_addresses, "ip_addresses", payload_ip_address, by_address)
+    ip_address_records = load("ip_addresses.json")
+    run(ip_address_records, "IP Addresses", nb.ipam.ip_addresses, "ip_addresses", payload_ip_address, by_address)
     run(load("fhrp_groups.json"), "FHRP Groups", nb.ipam.fhrp_groups, "fhrp_groups", payload_fhrp_group, by_name)
 
     # ── DCIM / Devices ────────────────────────────────────────────────────────────
@@ -640,6 +805,10 @@ def main():
     run(load("module_types.json"),   "Module Types",   nb.dcim.module_types,   "module_types",   payload_module_type,   by_name)
     run(load("device_roles.json"),   "Device Roles",   nb.dcim.device_roles,   "device_roles",   payload_device_role,   by_slug)
     run(load("platforms.json"),      "Platforms",      nb.dcim.platforms,      "platforms",      payload_platform,      by_slug)
+    # Virtual chassis created without master; master is set after devices are imported.
+    virtual_chassis_records = load("virtual_chassis.json")
+    run(virtual_chassis_records, "Virtual Chassis", nb.dcim.virtual_chassis, "virtual_chassis", payload_virtual_chassis,
+        lambda ep, rec: ep.get(name=rec["name"]) if rec.get("name") else None)
     run(load("devices.json"),        "Devices",        nb.dcim.devices,        "devices",        payload_device,
         lambda ep, rec: ep.get(name=rec["name"], site_id=im.get("sites", (rec.get("site") or {}).get("id"))))
     run(load("modules.json"),        "Modules",        nb.dcim.modules,        "modules",        payload_module,        None)
@@ -664,19 +833,48 @@ def main():
     run(load("power_panels.json"),   "Power Panels",   nb.dcim.power_panels,   "power_panels",   payload_power_panel,   by_name)
     run(load("power_feeds.json"),    "Power Feeds",    nb.dcim.power_feeds,    "power_feeds",    payload_power_feed,    by_name)
     run(load("cables.json"),         "Cables",         nb.dcim.cables,         "cables",         payload_cable,         None)
+    run(load("virtual_device_contexts.json"), "Virtual Device Contexts", nb.dcim.virtual_device_contexts,
+        "virtual_device_contexts", payload_virtual_device_context,
+        lambda ep, rec: ep.get(device_id=im.get("devices", (rec.get("device") or {}).get("id")), name=rec["name"]))
 
-    # ── Services (after devices and IPs) ─────────────────────────────────────────
+    # ── Virtual Chassis: set master device (second pass) ─────────────────────────
+    logger.info("=== Virtual Chassis Masters (second pass) ===")
+    u, s, e = update_virtual_chassis_masters(nb, virtual_chassis_records, im, logger)
+    total_updated += u
+    total_errors += e
+
+    # ── Virtualization / Virtual Machines ─────────────────────────────────────────
+    logger.info("=== Virtualization / Virtual Machines ===")
+    run(load("virtual_machines.json"), "Virtual Machines", nb.virtualization.virtual_machines, "virtual_machines",
+        payload_virtual_machine,
+        lambda ep, rec: (list(ep.filter(name=rec["name"])) or [None])[0])
+    run(load("vm_interfaces.json"), "VM Interfaces", nb.virtualization.interfaces, "vm_interfaces",
+        payload_vm_interface,
+        lambda ep, rec: ep.get(
+            virtual_machine_id=im.get("virtual_machines", (rec.get("virtual_machine") or {}).get("id")),
+            name=rec["name"]))
+
+    # ── Services (after devices, VMs, and IPs) ────────────────────────────────────
     logger.info("=== Services ===")
     run(load("service_templates.json"), "Service Templates", nb.ipam.service_templates, "service_templates", payload_service_template, by_name)
     run(load("services.json"),          "Services",          nb.ipam.services,          "services",          payload_service, None)
-    run(load("fhrp_group_assignments.json"), "FHRP Assignments", nb.ipam.fhrp_group_assignments, "fhrp_group_assignments", payload_fhrp_group_assignment, None)
+    run(load("fhrp_group_assignments.json"), "FHRP Assignments", nb.ipam.fhrp_group_assignments,
+        "fhrp_group_assignments", payload_fhrp_group_assignment, None)
+
+    # ── IP Address interface assignments (second pass) ────────────────────────────
+    # Runs after all device interfaces and VM interfaces are imported.
+    logger.info("=== IP Address Assignments (second pass) ===")
+    u, s, e = update_ip_assignments(nb, ip_address_records, im, logger)
+    total_updated += u
+    total_errors += e
 
     logger.info(
         f"\n=== Import complete ===\n"
-        f"  Total created : {total_created}\n"
-        f"  Total skipped : {total_skipped}\n"
-        f"  Total errors  : {total_errors}\n"
-        f"  Log file      : {args.log}"
+        f"  Total created  : {total_created}\n"
+        f"  Total skipped  : {total_skipped}\n"
+        f"  Total updated  : {total_updated}\n"
+        f"  Total errors   : {total_errors}\n"
+        f"  Log file       : {args.log}"
     )
 
 
