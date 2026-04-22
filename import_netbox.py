@@ -703,7 +703,12 @@ def main():
     run(load("vrfs.json"), "VRFs", nb.ipam.vrfs, "vrfs", payload_vrf,
         lambda ep, rec: (ep.filter(name=rec["name"], rd=rec.get("rd")) or [None])[0])
     run(load("vlan_groups.json"), "VLAN Groups", nb.ipam.vlan_groups, "vlan_groups", payload_vlan_group, by_slug)
-    run(load("vlans.json"),       "VLANs",       nb.ipam.vlans,       "vlans",       payload_vlan,       by_vid_group)
+    run(load("vlans.json"), "VLANs", nb.ipam.vlans, "vlans", payload_vlan,
+        lambda ep, rec: (ep.filter(
+            vid=rec["vid"],
+            **( {"group_id": im.get("vlan_groups", rec["group"]["id"])}
+                if rec.get("group") and rec["group"].get("id") else {} )
+        ) or [None])[0])
     run(load("prefixes.json"),    "Prefixes",    nb.ipam.prefixes,    "prefixes",    payload_prefix,     by_prefix)
     run(load("ip_ranges.json"),   "IP Ranges",   nb.ipam.ip_ranges,   "ip_ranges",   payload_ip_range,
         lambda ep, rec: (ep.filter(start_address=rec["start_address"], end_address=rec["end_address"]) or [None])[0])
