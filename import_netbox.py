@@ -18,6 +18,9 @@ from pathlib import Path
 
 import requests
 
+BATCH_SIZE = 50          # objects per bulk-create POST
+LOOKUP_BATCH_SIZE = 200  # objects per bulk-lookup GET
+
 
 # ─── NetBox REST client ──────────────────────────────────────────────────────────
 
@@ -77,6 +80,12 @@ class Endpoint:
         r = self._session.patch(f"{self._url}{obj_id}/", json=payload)
         self._raise(r)
         return Record(r.json())
+
+    def create_bulk(self, payloads: list) -> list:
+        r = self._session.post(self._url, json=payloads)
+        self._raise(r)
+        data = r.json()
+        return [Record(obj) for obj in (data if isinstance(data, list) else [data])]
 
 
 class _App:
@@ -171,13 +180,29 @@ def import_objects(
 ):
     created = skipped = errors = 0
 
+    # ── Phase 1 : lookup ─────────────────────────────────────────────────────
+    # For known simple lookup functions use a single bulk GET instead of N individual calls.
+    bulk_key_field = None
+    existing_map = None  # {key_value: Record} when bulk lookup succeeds
+    if lookup_fn in BULK_LOOKUP_MAP and records:
+        bulk_key_field, bulk_fn = BULK_LOOKUP_MAP[lookup_fn]
+        try:
+            existing_map = bulk_fn(nb_endpoint, records)
+        except Exception as e:
+            logger.warning(f"[{label}] Bulk lookup failed ({e}), falling back to per-record lookups")
+
+    to_create = []  # list of (old_id, display_name, payload)
+
     for rec in records:
         old_id = rec.get("id")
+        display = rec.get("name", rec.get("address", rec.get("slug", old_id)))
         try:
             payload = payload_fn(rec, id_mapper) if payload_fn else clean_payload(rec)
 
             existing = None
-            if lookup_fn:
+            if existing_map is not None:
+                existing = existing_map.get(rec.get(bulk_key_field))
+            elif lookup_fn:
                 try:
                     existing = lookup_fn(nb_endpoint, rec)
                 except Exception:
@@ -187,22 +212,46 @@ def import_objects(
                 skipped += 1
                 if old_id is not None and type_name:
                     id_mapper.register(type_name, old_id, existing.id)
-                logger.info(f"[{label}] SKIP (exists): {rec.get('name', rec.get('address', old_id))}")
+                logger.info(f"[{label}] SKIP (exists): {display}")
                 continue
 
-            new_obj = nb_endpoint.create(**payload)
-            created += 1
-            if old_id is not None and type_name:
-                id_mapper.register(type_name, old_id, new_obj.id)
-            logger.info(f"[{label}] CREATED: {rec.get('name', rec.get('address', new_obj.id))}")
+            to_create.append((old_id, display, payload))
 
         except Exception as e:
             errors += 1
             logger.error(
-                f"[{label}] ERROR on record id={old_id} "
-                f"name={rec.get('name', rec.get('address', '?'))}: {e}\n"
+                f"[{label}] ERROR on record id={old_id} name={display}: {e}\n"
                 f"{traceback.format_exc()}"
             )
+
+    # ── Phase 2 : batch create ───────────────────────────────────────────────
+    for i in range(0, len(to_create), BATCH_SIZE):
+        chunk = to_create[i:i + BATCH_SIZE]
+        payloads = [p for _, _, p in chunk]
+        try:
+            new_objs = nb_endpoint.create_bulk(payloads)
+            for (old_id, display, _), new_obj in zip(chunk, new_objs):
+                created += 1
+                if old_id is not None and type_name:
+                    id_mapper.register(type_name, old_id, new_obj.id)
+                logger.info(f"[{label}] CREATED: {display}")
+        except Exception as batch_err:
+            logger.warning(
+                f"[{label}] Batch [{i}:{i + len(chunk)}] failed ({batch_err}), retrying individually..."
+            )
+            for old_id, display, payload in chunk:
+                try:
+                    new_obj = nb_endpoint.create(**payload)
+                    created += 1
+                    if old_id is not None and type_name:
+                        id_mapper.register(type_name, old_id, new_obj.id)
+                    logger.info(f"[{label}] CREATED: {display}")
+                except Exception as e:
+                    errors += 1
+                    logger.error(
+                        f"[{label}] ERROR on record id={old_id} name={display}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
 
     logger.info(f"[{label}] Done — created={created} skipped={skipped} errors={errors}")
     return created, skipped, errors
@@ -251,6 +300,42 @@ def by_vid_group(ep, rec):
         params["group_id"] = rec["group"]["id"]
     hits = ep.filter(**params)
     return hits[0] if hits else None
+
+
+# ─── Bulk lookup helpers ─────────────────────────────────────────────────────────
+
+def _bulk_fetch(ep, field, values):
+    """Single multi-value GET per LOOKUP_BATCH_SIZE records; returns {value: Record}."""
+    values = [v for v in values if v is not None]
+    if not values:
+        return {}
+    result = {}
+    for i in range(0, len(values), LOOKUP_BATCH_SIZE):
+        batch = values[i:i + LOOKUP_BATCH_SIZE]
+        for obj in ep.filter(**{field: batch}):
+            result[obj[field]] = obj
+    return result
+
+def bulk_by_slug(ep, records):
+    return _bulk_fetch(ep, "slug", [r.get("slug") for r in records])
+
+def bulk_by_name(ep, records):
+    return _bulk_fetch(ep, "name", [r.get("name") for r in records])
+
+def bulk_by_address(ep, records):
+    return _bulk_fetch(ep, "address", [r.get("address") for r in records])
+
+def bulk_by_prefix(ep, records):
+    return _bulk_fetch(ep, "prefix", [r.get("prefix") for r in records])
+
+# Maps simple per-record lookup functions → (key_field, bulk_equivalent)
+# import_objects uses this to automatically switch to bulk lookup.
+BULK_LOOKUP_MAP = {
+    by_slug:    ("slug",    bulk_by_slug),
+    by_name:    ("name",    bulk_by_name),
+    by_address: ("address", bulk_by_address),
+    by_prefix:  ("prefix",  bulk_by_prefix),
+}
 
 
 # ─── Payload builders ────────────────────────────────────────────────────────────
